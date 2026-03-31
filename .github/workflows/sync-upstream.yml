@@ -1,0 +1,43 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    # 每週一 UTC 00:00（台灣週一早上 08:00）
+    - cron: "0 0 * * 1"
+  workflow_dispatch:
+    inputs:
+      sync_test_mode:
+        description: 'Test Mode (dry run)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    name: Sync master with upstream latest
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Sync upstream changes
+        id: sync
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
+        with:
+          target_sync_branch: master
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          upstream_sync_branch: master
+          upstream_sync_repo: quantopian/zipline
+          test_mode: ${{ inputs.sync_test_mode }}
+
+      - name: New commits found
+        if: steps.sync.outputs.has_new_commits == 'true'
+        run: echo "New commits were found to sync."
+
+      - name: No new commits
+        if: steps.sync.outputs.has_new_commits == 'false'
+        run: echo "There were no new commits."
