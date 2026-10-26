@@ -105,9 +105,9 @@ jobs:
             --jq '.[0].number // ""')"
 
           PR_TITLE="chore: sync upstream ${UPSTREAM_REPOSITORY}@${SHORT_SHA}"
-          PR_BODY="Automated upstream synchronization for `$TARGET_BRANCH` from `${UPSTREAM_REPOSITORY}` (`${UPSTREAM_BRANCH}` at `${UPSTREAM_SHA}`).
+          PR_BODY="Automated upstream synchronization for ${TARGET_BRANCH} from ${UPSTREAM_REPOSITORY} (${UPSTREAM_BRANCH} at ${UPSTREAM_SHA}).
 
-          The upstream commit history is preserved on this review branch. Review the complete upstream diff and the repository's CI results before merging. This workflow only pushes its dedicated `$SYNC_BRANCH` branch."
+          The upstream commit history is preserved on this review branch. Review the complete upstream diff and the repository's CI results before merging. This workflow only pushes its dedicated ${SYNC_BRANCH} branch."
 
           if [ -n "$PR_NUMBER" ]; then
             gh pr edit "$PR_NUMBER" --repo "$GH_REPO" --title "$PR_TITLE" --body "$PR_BODY"
