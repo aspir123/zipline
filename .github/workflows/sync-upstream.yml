@@ -1,43 +1,116 @@
-name: Sync Fork with Upstream
+name: Sync Fork with Upstream (PR)
 
 on:
   schedule:
-    # 每週一 UTC 00:00（台灣週一早上 08:00）
     - cron: "0 0 * * 1"
   workflow_dispatch:
     inputs:
       sync_test_mode:
-        description: 'Test Mode (dry run)'
+        description: "Dry run: fetch and merge locally without pushing or opening a PR"
         type: boolean
+        required: false
         default: false
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: sync-upstream-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   sync:
+    name: Prepare upstream sync PR
     runs-on: ubuntu-latest
-    name: Sync master with upstream latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      TARGET_BRANCH: master
+      UPSTREAM_REPOSITORY: quantopian/zipline
+      UPSTREAM_BRANCH: master
     steps:
-      - name: Checkout target repo
-        uses: actions/checkout@v4
+      - name: Check out fork history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: master
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
 
-      - name: Sync upstream changes
-        id: sync
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
-        with:
-          target_sync_branch: master
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-          upstream_sync_branch: master
-          upstream_sync_repo: quantopian/zipline
-          test_mode: ${{ inputs.sync_test_mode }}
+      - name: Merge upstream into a review branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.sync_test_mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: New commits found
-        if: steps.sync.outputs.has_new_commits == 'true'
-        run: echo "New commits were found to sync."
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --filter=blob:none --no-tags origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+          git fetch --filter=blob:none --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
 
-      - name: No new commits
-        if: steps.sync.outputs.has_new_commits == 'false'
-        run: echo "There were no new commits."
+          TARGET_REF="origin/${TARGET_BRANCH}"
+          UPSTREAM_REF="upstream/${UPSTREAM_BRANCH}"
+          UPSTREAM_SHA="$(git rev-parse "${UPSTREAM_REF}")"
+          SHORT_SHA="${UPSTREAM_SHA:0:12}"
+          UPSTREAM_AHEAD="$(git rev-list --count "${TARGET_REF}..${UPSTREAM_REF}")"
+
+          if [ "$UPSTREAM_AHEAD" -eq 0 ]; then
+            echo "Upstream is already contained in ${TARGET_BRANCH}; nothing to sync."
+            exit 0
+          fi
+
+          OPEN_SYNC_BRANCH="$(gh pr list \
+            --repo "$GH_REPO" \
+            --state open \
+            --base "$TARGET_BRANCH" \
+            --json headRefName,title,createdAt \
+            --jq '[.[] | select(.headRefName | startswith("automation/sync-upstream-")) | select(.title | startswith("chore: sync upstream "))] | sort_by(.createdAt) | last | .headRefName // ""')"
+
+          if [ -n "$OPEN_SYNC_BRANCH" ]; then
+            SYNC_BRANCH="$OPEN_SYNC_BRANCH"
+            git fetch --filter=blob:none --no-tags origin "refs/heads/$SYNC_BRANCH:refs/remotes/origin/$SYNC_BRANCH"
+            git switch --create "$SYNC_BRANCH" --track "origin/$SYNC_BRANCH"
+          else
+            SYNC_BRANCH="automation/sync-upstream-$SHORT_SHA"
+            SUFFIX=1
+            while git ls-remote --exit-code --heads origin "refs/heads/$SYNC_BRANCH" >/dev/null 2>&1; do
+              SYNC_BRANCH="automation/sync-upstream-$SHORT_SHA-$SUFFIX"
+              SUFFIX=$((SUFFIX + 1))
+            done
+            git switch --create "$SYNC_BRANCH" "$TARGET_REF"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit "$TARGET_REF"
+          git merge --no-edit "$UPSTREAM_REF"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run completed. No branch was pushed and no PR was opened."
+            exit 0
+          fi
+
+          gh auth setup-git --hostname github.com
+          git push --set-upstream origin "$SYNC_BRANCH"
+
+          PR_NUMBER="$(gh pr list \
+            --repo "$GH_REPO" \
+            --state open \
+            --base "$TARGET_BRANCH" \
+            --head "$SYNC_BRANCH" \
+            --json number \
+            --jq '.[0].number // ""')"
+
+          PR_TITLE="chore: sync upstream ${UPSTREAM_REPOSITORY}@${SHORT_SHA}"
+          PR_BODY="Automated upstream synchronization for `$TARGET_BRANCH` from `${UPSTREAM_REPOSITORY}` (`${UPSTREAM_BRANCH}` at `${UPSTREAM_SHA}`).
+
+          The upstream commit history is preserved on this review branch. Review the complete upstream diff and the repository's CI results before merging. This workflow only pushes its dedicated `$SYNC_BRANCH` branch."
+
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr edit "$PR_NUMBER" --repo "$GH_REPO" --title "$PR_TITLE" --body "$PR_BODY"
+          else
+            gh pr create --repo "$GH_REPO" --base "$TARGET_BRANCH" --head "$SYNC_BRANCH" --title "$PR_TITLE" --body "$PR_BODY"
+          fi
