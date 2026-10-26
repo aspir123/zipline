@@ -40,7 +40,7 @@ jobs:
 
       - name: Merge upstream into a review branch
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_TOKEN || github.token }}
           GH_REPO: ${{ github.repository }}
           DRY_RUN: ${{ inputs.sync_test_mode }}
         shell: bash
@@ -62,12 +62,12 @@ jobs:
             exit 0
           fi
 
-          OPEN_SYNC_BRANCH="$(gh pr list \
-            --repo "$GH_REPO" \
-            --state open \
-            --base "$TARGET_BRANCH" \
-            --json headRefName,title,createdAt \
-            --jq '[.[] | select(.headRefName | startswith("automation/sync-upstream-")) | select(.title | startswith("chore: sync upstream "))] | sort_by(.createdAt) | last | .headRefName // ""')"
+          OPEN_PRS_JSON="$(gh api --paginate --slurp \
+            "repos/${GH_REPO}/pulls?state=open&base=${TARGET_BRANCH}&per_page=100")"
+          OPEN_SYNC_BRANCH="$(jq -r '
+            [.[][] | select(.head.repo.full_name == env.GH_REPO)
+             | select(.head.ref | startswith("automation/sync-upstream-"))]
+            | sort_by(.created_at) | last | .head.ref // ""' <<< "$OPEN_PRS_JSON")"
 
           if [ -n "$OPEN_SYNC_BRANCH" ]; then
             SYNC_BRANCH="$OPEN_SYNC_BRANCH"
@@ -96,13 +96,11 @@ jobs:
           gh auth setup-git --hostname github.com
           git push --set-upstream origin "$SYNC_BRANCH"
 
-          PR_NUMBER="$(gh pr list \
-            --repo "$GH_REPO" \
-            --state open \
-            --base "$TARGET_BRANCH" \
-            --head "$SYNC_BRANCH" \
-            --json number \
-            --jq '.[0].number // ""')"
+          OPEN_PRS_JSON="$(gh api --paginate --slurp \
+            "repos/${GH_REPO}/pulls?state=open&base=${TARGET_BRANCH}&per_page=100")"
+          PR_NUMBER="$(jq -r --arg branch "$SYNC_BRANCH" '
+            [.[][] | select(.head.repo.full_name == env.GH_REPO) | select(.head.ref == $branch)]
+            | .[0].number // ""' <<< "$OPEN_PRS_JSON")"
 
           PR_TITLE="chore: sync upstream ${UPSTREAM_REPOSITORY}@${SHORT_SHA}"
           PR_BODY="Automated upstream synchronization for ${TARGET_BRANCH} from ${UPSTREAM_REPOSITORY} (${UPSTREAM_BRANCH} at ${UPSTREAM_SHA}).
