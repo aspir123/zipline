@@ -120,6 +120,8 @@ jobs:
             echo "::notice::Workflow changes detected; push and pull_request workflows are skipped, and the sync PR will remain open."
           fi
 
+          EXPECTED_HEAD_SHA="$(git rev-parse HEAD)"
+
           gh auth setup-git --hostname github.com
           git push --set-upstream origin "$SYNC_BRANCH"
 
@@ -177,8 +179,8 @@ jobs:
           PR_BASE_BRANCH="$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json baseRefName --jq '.baseRefName')"
           PR_HEAD_BRANCH="$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json headRefName --jq '.headRefName')"
           PR_HEAD_SHA="$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json headRefOid --jq '.headRefOid')"
-          if [ "$PR_STATE" != "OPEN" ] || [ "$PR_BASE_BRANCH" != "$TARGET_BRANCH" ] || [ "$PR_HEAD_BRANCH" != "$SYNC_BRANCH" ] || [ -z "$PR_HEAD_SHA" ]; then
-            echo "::error::The upstream sync pull request is not open, does not target the expected base and sync branch, or its head SHA could not be read."
+          if [ "$PR_STATE" != "OPEN" ] || [ "$PR_BASE_BRANCH" != "$TARGET_BRANCH" ] || [ "$PR_HEAD_BRANCH" != "$SYNC_BRANCH" ] || [ -z "$PR_HEAD_SHA" ] || [ "$PR_HEAD_SHA" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "::error::The upstream sync pull request is not open, targets an unexpected base or branch, or its head SHA differs from the exact revision whose paths were checked."
             exit 1
           fi
 
