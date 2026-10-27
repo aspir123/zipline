@@ -61,6 +61,16 @@ jobs:
             exit 1
           fi
 
+          if [ "$DRY_RUN" = "true" ]; then
+            AUTOMATION_USER="$GH_OWNER"
+          else
+            AUTOMATION_USER="$(gh api user --jq '.login')"
+          fi
+          if [ -z "$AUTOMATION_USER" ]; then
+            echo "::error::Could not identify the account used by the sync token."
+            exit 1
+          fi
+
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
           git fetch --filter=blob:none --no-tags origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
           git fetch --filter=blob:none --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
@@ -79,9 +89,9 @@ jobs:
 
           OPEN_PRS_JSON="$(gh api --paginate --slurp \
             "repos/${GH_REPO}/pulls?state=open&base=${TARGET_BRANCH}&per_page=100")"
-          OPEN_SYNC_BRANCH="$(jq -r --arg marker "$SYNC_PR_MARKER" --arg owner "$GH_OWNER" '
+          OPEN_SYNC_BRANCH="$(jq -r --arg marker "$SYNC_PR_MARKER" --arg automation_user "$AUTOMATION_USER" '
             [.[][] | select(.head.repo.full_name == env.GH_REPO)
-             | select(.user.login == $owner)
+             | select(.user.login == $automation_user)
              | select((.body // "") | contains($marker))
              | select(.head.ref | startswith("automation/sync-upstream-"))]
             | sort_by(.created_at) | last | .head.ref // ""' <<< "$OPEN_PRS_JSON")"
@@ -127,9 +137,9 @@ jobs:
 
           OPEN_PRS_JSON="$(gh api --paginate --slurp \
             "repos/${GH_REPO}/pulls?state=open&base=${TARGET_BRANCH}&per_page=100")"
-          PR_NUMBER="$(jq -r --arg branch "$SYNC_BRANCH" --arg marker "$SYNC_PR_MARKER" --arg owner "$GH_OWNER" '
+          PR_NUMBER="$(jq -r --arg branch "$SYNC_BRANCH" --arg marker "$SYNC_PR_MARKER" --arg automation_user "$AUTOMATION_USER" '
             [.[][] | select(.head.repo.full_name == env.GH_REPO)
-             | select(.user.login == $owner)
+             | select(.user.login == $automation_user)
              | select((.body // "") | contains($marker))
              | select(.head.ref == $branch)]
             | .[0].number // ""' <<< "$OPEN_PRS_JSON")"
