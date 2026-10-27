@@ -1,43 +1,190 @@
-name: Sync Fork with Upstream
+name: Sync Fork with Upstream (CI-visible auto-merge)
 
 on:
   schedule:
-    # 每週一 UTC 00:00（台灣週一早上 08:00）
     - cron: "0 0 * * 1"
   workflow_dispatch:
     inputs:
       sync_test_mode:
-        description: 'Test Mode (dry run)'
+        description: "Dry run: fetch and merge locally without pushing or opening a PR"
         type: boolean
+        required: false
         default: false
 
 permissions:
-  contents: write
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: sync-upstream-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   sync:
+    if: ${{ github.ref == 'refs/heads/master' }}
+    name: Prepare and merge source-only sync PR
     runs-on: ubuntu-latest
-    name: Sync master with upstream latest
+    timeout-minutes: 30
+    environment:
+      name: sync-upstream
+      deployment: false
+    env:
+      TARGET_BRANCH: master
+      UPSTREAM_REPOSITORY: quantopian/zipline
+      UPSTREAM_BRANCH: master
     steps:
-      - name: Checkout target repo
-        uses: actions/checkout@v4
+      - name: Check out fork history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: master
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
 
-      - name: Sync upstream changes
-        id: sync
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
-        with:
-          target_sync_branch: master
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-          upstream_sync_branch: master
-          upstream_sync_repo: quantopian/zipline
-          test_mode: ${{ inputs.sync_test_mode }}
+      - name: Merge upstream into a sync branch
+        env:
+          GH_TOKEN: ${{ github.event_name == 'workflow_dispatch' && inputs.sync_test_mode && github.token || secrets.SYNC_UPSTREAM_TOKEN || github.token }}
+          SYNC_UPSTREAM_TOKEN: ${{ !inputs.sync_test_mode && secrets.SYNC_UPSTREAM_TOKEN || '' }}
+          GH_REPO: ${{ github.repository }}
+          GH_OWNER: ${{ github.repository_owner }}
+          DRY_RUN: ${{ inputs.sync_test_mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/master" ]; then
+            echo "::error::Sync runs are allowed only from refs/heads/master."
+            exit 1
+          fi
 
-      - name: New commits found
-        if: steps.sync.outputs.has_new_commits == 'true'
-        run: echo "New commits were found to sync."
+          if [ "$DRY_RUN" != "true" ] && [ -z "$SYNC_UPSTREAM_TOKEN" ]; then
+            echo "::error::SYNC_UPSTREAM_TOKEN is required for non-dry-run syncs."
+            exit 1
+          fi
 
-      - name: No new commits
-        if: steps.sync.outputs.has_new_commits == 'false'
-        run: echo "There were no new commits."
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --filter=blob:none --no-tags origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+          git fetch --filter=blob:none --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          TARGET_REF="origin/${TARGET_BRANCH}"
+          UPSTREAM_REF="upstream/${UPSTREAM_BRANCH}"
+          UPSTREAM_SHA="$(git rev-parse "${UPSTREAM_REF}")"
+          SHORT_SHA="${UPSTREAM_SHA:0:12}"
+          UPSTREAM_AHEAD="$(git rev-list --count "${TARGET_REF}..${UPSTREAM_REF}")"
+          SYNC_PR_MARKER="<!-- codex-upstream-sync:${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH} -->"
+
+          if [ "$UPSTREAM_AHEAD" -eq 0 ]; then
+            echo "Upstream is already contained in ${TARGET_BRANCH}; nothing to sync."
+            exit 0
+          fi
+
+          OPEN_PRS_JSON="$(gh api --paginate --slurp \
+            "repos/${GH_REPO}/pulls?state=open&base=${TARGET_BRANCH}&per_page=100")"
+          OPEN_SYNC_BRANCH="$(jq -r --arg marker "$SYNC_PR_MARKER" --arg owner "$GH_OWNER" '
+            [.[][] | select(.head.repo.full_name == env.GH_REPO)
+             | select(.user.login == $owner)
+             | select((.body // "") | contains($marker))
+             | select(.head.ref | startswith("automation/sync-upstream-"))]
+            | sort_by(.created_at) | last | .head.ref // ""' <<< "$OPEN_PRS_JSON")"
+
+          if [ -n "$OPEN_SYNC_BRANCH" ]; then
+            SYNC_BRANCH="$OPEN_SYNC_BRANCH"
+            git fetch --filter=blob:none --no-tags origin "refs/heads/$SYNC_BRANCH:refs/remotes/origin/$SYNC_BRANCH"
+            git switch --create "$SYNC_BRANCH" --track "origin/$SYNC_BRANCH"
+          else
+            SYNC_BRANCH="automation/sync-upstream-$SHORT_SHA"
+            SUFFIX=1
+            while git ls-remote --exit-code --heads origin "refs/heads/$SYNC_BRANCH" >/dev/null 2>&1; do
+              SYNC_BRANCH="automation/sync-upstream-$SHORT_SHA-$SUFFIX"
+              SUFFIX=$((SUFFIX + 1))
+            done
+            git switch --create "$SYNC_BRANCH" "$TARGET_REF"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit "$TARGET_REF"
+          git merge --no-edit "$UPSTREAM_REF"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run completed. No branch was pushed and no PR was opened."
+            exit 0
+          fi
+
+          # Same-repository PR workflows can receive repository secrets. If upstream
+          # changes workflow files, suppress push/pull_request runs on that batch
+          # before publishing the branch; the PR path gate below still holds it open.
+          # Disable rename detection so moves out of this directory match the deleted workflow path.
+          WORKFLOW_DIFF="$(git diff --no-renames --name-only "$TARGET_REF" HEAD -- .github/workflows/)"
+          if [ -n "$WORKFLOW_DIFF" ]; then
+            git commit --allow-empty -m "chore(sync): hold workflow changes [skip ci]"
+            echo "::notice::Workflow changes detected; push and pull_request workflows are skipped, and the sync PR will remain open."
+          fi
+
+          gh auth setup-git --hostname github.com
+          git push --set-upstream origin "$SYNC_BRANCH"
+
+          OPEN_PRS_JSON="$(gh api --paginate --slurp \
+            "repos/${GH_REPO}/pulls?state=open&base=${TARGET_BRANCH}&per_page=100")"
+          PR_NUMBER="$(jq -r --arg branch "$SYNC_BRANCH" --arg marker "$SYNC_PR_MARKER" --arg owner "$GH_OWNER" '
+            [.[][] | select(.head.repo.full_name == env.GH_REPO)
+             | select(.user.login == $owner)
+             | select((.body // "") | contains($marker))
+             | select(.head.ref == $branch)]
+            | .[0].number // ""' <<< "$OPEN_PRS_JSON")"
+
+          PR_TITLE="chore: sync upstream ${UPSTREAM_REPOSITORY}@${SHORT_SHA}"
+          PR_BODY="${SYNC_PR_MARKER}
+
+          Automated weekly upstream synchronization for ${TARGET_BRANCH} from ${UPSTREAM_REPOSITORY} (${UPSTREAM_BRANCH} at ${UPSTREAM_SHA}).
+
+          The upstream commit history is preserved on this dedicated sync branch. Ordinary source-only sync PRs are merged immediately after the PR is opened or updated, without waiting for CI or blocking on CI failures. CI runs normally on the PR and its result remains visible, but CI is informational rather than a merge gate. No human review is requested for ordinary source-only updates. If any changed or renamed path is under .github/workflows/, the entire upstream batch remains in the open PR for optional AI scan or owner action. This workflow never pushes directly to ${TARGET_BRANCH}.
+
+          Required setup: create a GitHub Actions environment named sync-upstream, allow deployments only from the master branch (do not allow refs/pull/*/merge), and store SYNC_UPSTREAM_TOKEN as an environment secret, not a repository or organization secret. Use a fine-grained token limited to this repository with Contents: read/write, Pull requests: read/write, and Workflows: read/write. Do not add an environment approval requirement."
+
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr edit "$PR_NUMBER" --repo "$GH_REPO" --title "$PR_TITLE" --body "$PR_BODY"
+          else
+            gh pr create --repo "$GH_REPO" --base "$TARGET_BRANCH" --head "$SYNC_BRANCH" --title "$PR_TITLE" --body "$PR_BODY"
+            PR_NUMBER="$(gh pr view "$SYNC_BRANCH" --repo "$GH_REPO" --json number --jq '.number')"
+          fi
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::Could not identify the upstream sync pull request."
+            exit 1
+          fi
+
+          PR_FILES_JSON="$(gh api --paginate --slurp \
+            "repos/${GH_REPO}/pulls/${PR_NUMBER}/files?per_page=100")"
+          PR_FILE_COUNT="$(jq '[.[][]] | length' <<< "$PR_FILES_JSON")"
+          if [ "$PR_FILE_COUNT" -ge 3000 ]; then
+            echo "::notice::The PR file list reached GitHub's 3,000-file API limit; leaving the PR open."
+            exit 0
+          fi
+
+          HAS_SENSITIVE_PATH_CHANGES="$(jq -r '
+            def hold_path($path):
+              ($path | startswith(".github/workflows/"));
+            any(.[][];
+              hold_path(.filename // "")
+              or hold_path(.previous_filename // "")
+            )' <<< "$PR_FILES_JSON")"
+          if [ "$HAS_SENSITIVE_PATH_CHANGES" = "true" ]; then
+            echo "::notice::Upstream sync PR changes GitHub workflow files; leaving the entire PR open for optional AI scan or owner action."
+            exit 0
+          fi
+
+          PR_STATE="$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json state --jq '.state')"
+          PR_BASE_BRANCH="$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json baseRefName --jq '.baseRefName')"
+          PR_HEAD_BRANCH="$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json headRefName --jq '.headRefName')"
+          PR_HEAD_SHA="$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json headRefOid --jq '.headRefOid')"
+          if [ "$PR_STATE" != "OPEN" ] || [ "$PR_BASE_BRANCH" != "$TARGET_BRANCH" ] || [ "$PR_HEAD_BRANCH" != "$SYNC_BRANCH" ] || [ -z "$PR_HEAD_SHA" ]; then
+            echo "::error::The upstream sync pull request is not open, does not target the expected base and sync branch, or its head SHA could not be read."
+            exit 1
+          fi
+
+          echo "::notice::CI runs independently on the pull request. Its result is visible but does not delay or gate this source-only sync merge."
+          MERGE_RESULT="$(gh api --method PUT "repos/${GH_REPO}/pulls/${PR_NUMBER}/merge" -f merge_method=merge -f sha="$PR_HEAD_SHA" --jq '.merged')"
+          if [ "$MERGE_RESULT" != "true" ]; then
+            echo "::error::GitHub did not confirm that the exact-head source-only sync PR was merged."
+            exit 1
+          fi
